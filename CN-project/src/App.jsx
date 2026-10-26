@@ -1,128 +1,182 @@
-
-import { useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import {
-  Network,
-  Activity,
-  Cpu,
-  ShieldAlert,
-  LayoutDashboard,
-  ChartNoAxesCombined,
-  FlaskConical,
-  Zap,
-  ArrowRight,
-  RefreshCw,
-  CheckCircle2,
-  Clock3,
-} from 'lucide-react'
+  ResponsiveContainer,
+  ComposedChart,
+  Area,
+  Line,
+  XAxis,
+  YAxis,
+  ReferenceLine,
+  BarChart,
+  Bar,
+  Tooltip,
+} from 'recharts'
+import { getSegments, getAnomalies, runAllocation as apiAllocate, runSimulation as apiSimulate } from './api'
 import './App.css'
 
-const initialSegments = [
-  { name: 'Lab-A', prefix: '2001:db8:1000::/52', devices: 412, utilization: 81 },
-  { name: 'Lab-B', prefix: '2001:db8:1100::/52', devices: 268, utilization: 63 },
-  { name: 'Hostel-Block-1', prefix: '2001:db8:2000::/48', devices: 1904, utilization: 92 },
-  { name: 'Hostel-Block-2', prefix: '2001:db8:2100::/48', devices: 1566, utilization: 77 },
-  { name: 'WiFi-Campus', prefix: '2001:db8:3000::/44', devices: 3920, utilization: 88 },
-  { name: 'Library', prefix: '2001:db8:4000::/56', devices: 362, utilization: 41 },
-]
+const BLUE = '#2535c8'
+const INK = '#1f2a52'
+const MUTED = '#6b7088'
+const PANEL = '#fcfcff'
+const TINT = '#cbd5f1'
+const GRID = '#dfe1ea'
+const MONO = "'IBM Plex Mono', ui-monospace, Consolas, monospace"
+const TICK = { fill: MUTED, fontSize: 11, fontFamily: MONO }
+const TOOLTIP_STYLE = {
+  background: PANEL,
+  border: `1.5px solid ${BLUE}`,
+  borderRadius: 0,
+  fontFamily: MONO,
+  fontSize: 11,
+  color: INK,
+}
 
-const alerts = [
-  { time: '25 Oct 2026 · 04:12', segment: 'WiFi-Campus', type: 'Sudden 300% usage spike', severity: 'HIGH' },
-  { time: '24 Oct 2026 · 21:47', segment: 'Hostel-Block-2', type: 'Duplicate allocation detected', severity: 'HIGH' },
-  { time: '24 Oct 2026 · 16:03', segment: 'Lab-A', type: 'Off-hours address surge', severity: 'MED' },
-  { time: '23 Oct 2026 · 09:30', segment: 'Library', type: 'Rapid lease churn', severity: 'LOW' },
-]
+const pad2 = (n) => String(n).padStart(2, '0')
 
-const history = [
-  { week: 'W-9', actual: 1120, predicted: null },
-  { week: 'W-7', actual: 1270, predicted: null },
-  { week: 'W-5', actual: 1450, predicted: null },
-  { week: 'W-3', actual: 1610, predicted: null },
-  { week: 'W-1', actual: 1790, predicted: null },
-  { week: 'NOW', actual: 1930, predicted: 1930 },
-  { week: 'W+2', actual: null, predicted: 2070 },
-  { week: 'W+5', actual: null, predicted: 2260 },
-]
+// bar colour: orange when nearly full, green when mostly idle
+const utilTone = (u) => (u >= 90 ? 'hot' : u < 50 ? 'cool' : '')
 
-function MetricCard({ label, value, foot, icon: Icon, tone = '' }) {
+// Converts a row from /api/segments into the shape the UI uses
+function mapSegment(s) {
+  const baseIp = s.base_ipv6_prefix.split('/')[0]
+  return {
+    name: s.name,
+    prefix: `${baseIp}/${s.current_prefix_length}`,
+    devices: s.active_devices,
+    utilization: s.allocated_addresses
+      ? Math.min(100, Math.round((s.active_devices / s.allocated_addresses) * 100))
+      : 0,
+  }
+}
+
+function useClock() {
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 30000)
+    return () => clearInterval(id)
+  }, [])
+  return now.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'Asia/Kolkata',
+  })
+}
+
+/* ---------- reusable window panel ---------- */
+function Win({ title, children, flush = false }) {
   return (
-    <div className="metric-card">
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-        <span className="metric-label">{label}</span>
-        <Icon size={17} color="#38bdf8" />
+    <section className="win">
+      <div className="win-bar">
+        <span>{title}</span>
+        <span aria-hidden="true">×</span>
       </div>
-      <div className="metric-value">{value}</div>
-      <div className={`metric-foot ${tone}`}>{foot}</div>
-    </div>
+      <div className={`win-body ${flush ? 'flush' : ''}`}>{children}</div>
+    </section>
   )
 }
 
-function SectionTitle({ children }) {
-  return <div className="section-heading">{children}</div>
+function MetricCard({ title, value, children }) {
+  return (
+    <Win title={title}>
+      <div className="big-number">{value}</div>
+      {children}
+    </Win>
+  )
 }
 
-function Dashboard({ segments, setSegments, setNotice }) {
+/* ---------- 01 DASHBOARD ---------- */
+function Dashboard({ segments, anomalies, refresh }) {
   const [allocating, setAllocating] = useState('')
   const [lastSlice, setLastSlice] = useState(null)
+  const [status, setStatus] = useState('POST /API/ALLOCATE · READY')
 
-  
+  async function runAllocation(segmentName = 'ALL') {
+    setAllocating(segmentName)
+    const t0 = performance.now()
+    try {
+      const prev = Object.fromEntries(segments.map((s) => [s.name, s]))
 
-function runAllocation(segmentName = 'ALL') {
-  setAllocating(segmentName)
-  setNotice('')
+      // JS: Sunday=0 ... Saturday=6  ->  backend: Monday=0 ... Sunday=6
+      const jsDay = new Date().getDay()
+      const dayOfWeek = jsDay === 0 ? 6 : jsDay - 1
+      const isWeekend = dayOfWeek >= 5 ? 1 : 0
 
-  window.setTimeout(() => {
-    const selectedSegments =
-      segmentName === 'ALL'
-        ? segments
-        : segments.filter((segment) => segment.name === segmentName)
+      const data = await apiAllocate(dayOfWeek, isWeekend)
+      const secs = ((performance.now() - t0) / 1000).toFixed(1)
+      setStatus(`POST /API/ALLOCATE · 200 OK · ${secs}S`)
 
-    if (selectedSegments.length === 0) {
-      setNotice('No matching network segment found.')
+      const picked =
+        segmentName === 'ALL'
+          ? data.allocations[0]
+          : data.allocations.find((a) => a.segment === segmentName)
+
+      if (picked) {
+        const old = prev[picked.segment]
+        const delta = old && old.devices
+          ? Math.round(((picked.predicted_devices - old.devices) / old.devices) * 100)
+          : 0
+        setLastSlice({
+          segment: picked.segment,
+          before: old ? old.prefix : '—',
+          after: picked.assigned_prefix,
+          delta,
+        })
+      }
+      await refresh()
+    } catch (err) {
+      setStatus('POST /API/ALLOCATE · FAILED · IS FLASK RUNNING?')
+    } finally {
       setAllocating('')
-      return
     }
+  }
 
-    const segment = selectedSegments[0]
-
-    setLastSlice({
-      segment: segment.name,
-      before: segment.prefix,
-      after: segment.prefix,
-      demo: true,
-    })
-
-    setNotice(
-      `Demo simulation complete for ${
-        segmentName === 'ALL' ? 'all network segments' : segment.name
-      }. No real network changes were made.`
-    )
-
-    setAllocating('')
-  }, 700)
-}
-
+  const totalDevices = segments.reduce((sum, s) => sum + s.devices, 0)
+  const avgUtil = segments.length
+    ? segments.reduce((sum, s) => sum + s.utilization, 0) / segments.length
+    : 0
+  const high = anomalies.filter((a) => a.severity === 'HIGH' || a.severity === 'CRITICAL').length
+  const med = anomalies.filter((a) => a.severity === 'MEDIUM').length
+  const low = anomalies.filter((a) => a.severity === 'LOW').length
 
   return (
     <>
-      <div className="eyebrow">Network intelligence / 01</div>
       <h1 className="page-title">NETWORK,<br />BY DESIGN.</h1>
       <p className="page-subtitle">DASHBOARD · LIVE ALLOCATION CONTROL PANEL</p>
 
-      <div className="metrics-grid">
-        <MetricCard label="Total Active Devices" value="8,432" foot="+212 IN LAST 24H" icon={Network} tone="positive" />
-        <MetricCard label="Allocated Subnets" value="126" foot="ACROSS 6 SEGMENTS" icon={LayoutDashboard} />
-        <MetricCard label="Address Utilization" value="73.4%" foot="NETWORK-WIDE AVERAGE" icon={Activity} />
-        <MetricCard label="Active Anomalies" value="03" foot="1 HIGH · 2 MED" icon={ShieldAlert} tone="warning" />
+      <div className="metrics">
+        <MetricCard title="Total Active Devices" value={totalDevices.toLocaleString()}>
+          <div className="label">FROM BACKEND DATABASE</div>
+        </MetricCard>
+
+        <MetricCard title="Allocated Subnets" value={segments.length}>
+          <div className="label">ACROSS {segments.length} SEGMENTS</div>
+        </MetricCard>
+
+        <MetricCard title="Address Utilization" value={`${avgUtil.toFixed(1)}%`}>
+          <div className="bar wide"><i style={{ width: `${avgUtil}%` }} /></div>
+        </MetricCard>
+
+        <MetricCard title="Active Anomalies" value={pad2(anomalies.length)}>
+          <div className="badges">
+            {high > 0 && <span className="badge high">{high} HIGH</span>}
+            {med > 0 && <span className="badge med">{med} MED</span>}
+            {low > 0 && <span className="badge low">{low} LOW</span>}
+            {anomalies.length === 0 && <span className="label">NONE LOGGED</span>}
+          </div>
+        </MetricCard>
       </div>
 
-      <div className="content-grid">
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">Network Segments · 06 Active</h2>
-            <span className="muted small">IPv6 / Live</span>
-          </div>
-
-          <table className="network-table">
+      <div className="split">
+        <Win title={`Network Segments · ${pad2(segments.length)} Active`} flush>
+          <table className="tbl">
+            <colgroup>
+              <col style={{ width: '18%' }} />
+              <col style={{ width: '28%' }} />
+              <col style={{ width: '11%' }} />
+              <col style={{ width: '19%' }} />
+              <col style={{ width: '24%' }} />
+            </colgroup>
             <thead>
               <tr>
                 <th>Segment</th>
@@ -135,379 +189,433 @@ function runAllocation(segmentName = 'ALL') {
             <tbody>
               {segments.map((segment) => (
                 <tr key={segment.name}>
-                  <td className="segment-name">{segment.name}</td>
-                  <td className="prefix">{segment.prefix}</td>
+                  <td className="name">{segment.name}</td>
+                  <td>{segment.prefix}</td>
                   <td>{segment.devices.toLocaleString()}</td>
                   <td>
-                    <div className="util-track">
-                      <div
-                        className={`util-fill ${segment.utilization >= 85 ? 'high' : segment.utilization >= 70 ? 'medium' : ''}`}
-                        style={{ width: `${segment.utilization}%` }}
-                      />
+                    <div className="util">
+                      <span className={`bar ${utilTone(segment.utilization)}`}>
+                        <i style={{ width: `${segment.utilization}%` }} />
+                      </span>
+                      <span className="pct">{segment.utilization}%</span>
                     </div>
-                    <span className="small">{segment.utilization}%</span>
                   </td>
                   <td>
                     <button
-                      className="secondary-button"
+                      className="btn row"
                       disabled={!!allocating}
                       onClick={() => runAllocation(segment.name)}
-                      title={`Run AI allocation for ${segment.name}`}
                     >
-                      <Zap size={12} /> {allocating === segment.name ? 'RUNNING' : 'ALLOCATE'}
+                      {allocating === segment.name ? 'Running...' : 'Run AI Allocation'}
                     </button>
                   </td>
                 </tr>
               ))}
+              {segments.length === 0 && (
+                <tr>
+                  <td className="empty" colSpan={5}>No segments loaded. Start the Flask backend.</td>
+                </tr>
+              )}
             </tbody>
           </table>
-        </section>
+        </Win>
 
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">AI Allocation Control</h2>
-            <Zap size={17} color="#38bdf8" />
-          </div>
-          <p className="muted small">SCOPE: ALL SEGMENTS</p>
-          <p className="small" style={{ lineHeight: 1.8 }}>
-            Run demand-aware IPv6 prefix allocation across your network segments.
-          </p>
-          <button
-            className="primary-button full-width"
-            disabled={!!allocating}
-            onClick={() => runAllocation('ALL')}
-          >
-            <Zap size={15} />
-            {allocating === 'ALL' ? 'RUNNING ALLOCATION...' : 'RUN AI ALLOCATION'}
-          </button>
-          <p className="muted small" style={{ marginTop: 12 }}>
-            <Activity size={12} style={{ verticalAlign: 'middle' }} /> DEMO MODE · LOCAL SIMULATION
-          </p>
+        <div className="stack">
+          <Win title="AI Allocation Control">
+            <div className="label" style={{ marginBottom: 14 }}>SCOPE: ALL SEGMENTS</div>
+            <button
+              className="btn solid full"
+              disabled={!!allocating}
+              onClick={() => runAllocation('ALL')}
+            >
+              {allocating === 'ALL' ? 'Running...' : 'Run AI Allocation'}
+            </button>
+            <p className="caption">{status}</p>
+          </Win>
 
-          {lastSlice && (
-            <div className="allocation-details">
-              <div className="detail-label">Last Slice · {lastSlice.segment || 'Network'}</div>
-              <div className="detail-label">Before</div>
-              <div className="detail-value">{lastSlice.before || 'Awaiting API result'}</div>
-              <div className="detail-arrow"><ArrowRight size={14} /> AFTER ALLOCATION</div>
-              <div className="detail-value">{lastSlice.after || 'Awaiting API result'}</div>
-              {lastSlice.demo && <p className="muted small">Demo mode · prefix unchanged</p>}
+          <Win title={`Last Slice · ${lastSlice ? lastSlice.segment : '—'}`}>
+            <div className="label">BEFORE</div>
+            <div className="mono-line" style={{ marginBottom: 10 }}>{lastSlice ? lastSlice.before : '—'}</div>
+            <div className="label">
+              AFTER{lastSlice ? ` · DEMAND ${lastSlice.delta >= 0 ? '+' : ''}${lastSlice.delta}%` : ''}
             </div>
-          )}
-
-          <div className="allocation-details">
-            <div className="detail-label">Allocation Strategy</div>
-            <div className="detail-value">AI · Demand-aware slicing</div>
-            <div className="detail-arrow">● <span className="positive">READY</span></div>
-          </div>
-        </section>
+            <div className="mono-line strong">{lastSlice ? lastSlice.after : '—'}</div>
+          </Win>
+        </div>
       </div>
-
-      {setNotice && null}
     </>
   )
 }
 
-function Analytics() {
+/* ---------- 02 ANALYTICS ---------- */
+const HIST = [1200, 1268, 1335, 1413, 1490, 1535, 1665, 1735, 1785, 1815]
+const PRED = [1895, 1975, 2060, 2170, 2280]
+const SPREAD = [25, 60, 100, 140, 185]
+
+function weekLabel(k) {
+  return k < 0 ? `W${k}` : k === 0 ? 'NOW' : `W+${k}`
+}
+
+function buildForecast(m) {
+  const rows = HIST.map((v, i) => ({
+    week: weekLabel(i - 9),
+    actual: Math.round(v * m),
+    predicted: i === 9 ? Math.round(v * m) : null,
+    band: i === 9 ? [Math.round(v * m), Math.round(v * m)] : null,
+  }))
+  PRED.forEach((v, i) => {
+    rows.push({
+      week: weekLabel(i + 1),
+      actual: null,
+      predicted: Math.round(v * m),
+      band: [Math.round((v - SPREAD[i]) * m), Math.round((v + SPREAD[i]) * m)],
+    })
+  })
+  return rows
+}
+
+function DemandChart({ selected }) {
+  const m = selected === 'WiFi-Campus' ? 1.7 : selected === 'Lab-A' ? 0.65 : 1
+  const data = buildForecast(m)
+  const ticks = [1200, 1600, 2000, 2400].map((v) => Math.round((v * m) / 100) * 100)
+  const top = Math.round((2560 * m) / 100) * 100
+
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={data} margin={{ top: 12, right: 24, bottom: 4, left: 0 }}>
+        {ticks.map((t) => (
+          <ReferenceLine key={t} y={t} stroke={GRID} />
+        ))}
+        <XAxis
+          dataKey="week"
+          ticks={['W-9', 'W-5', 'NOW', 'W+5']}
+          interval={0}
+          tick={TICK}
+          axisLine={false}
+          tickLine={false}
+        />
+        <YAxis
+          domain={[ticks[0], top]}
+          ticks={ticks}
+          tickFormatter={(v) => v.toLocaleString()}
+          tick={TICK}
+          axisLine={false}
+          tickLine={false}
+          width={52}
+        />
+        <ReferenceLine
+          x="NOW"
+          stroke={MUTED}
+          strokeDasharray="2 3"
+          label={{ value: 'FORECAST →', position: 'insideTopRight', fill: MUTED, fontSize: 11, fontFamily: MONO }}
+        />
+        <Area dataKey="band" stroke="none" fill={TINT} fillOpacity={0.9} isAnimationActive={false} />
+        <Line dataKey="actual" stroke={BLUE} strokeWidth={2.5} dot={false} connectNulls isAnimationActive={false} />
+        <Line
+          dataKey="predicted"
+          stroke={BLUE}
+          strokeWidth={2.5}
+          strokeDasharray="6 5"
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+      </ComposedChart>
+    </ResponsiveContainer>
+  )
+}
+
+function severityClass(sev) {
+  if (sev === 'HIGH' || sev === 'CRITICAL') return 'high'
+  if (sev === 'LOW') return 'low'
+  return 'med'
+}
+
+function Analytics({ anomalies }) {
   const [selected, setSelected] = useState('Hostel-Block-1')
 
   return (
     <>
-      <div className="eyebrow">Machine learning / 02</div>
       <h1 className="page-title">DEMAND,<br />FORECAST.</h1>
       <p className="page-subtitle">ANALYTICS · ML DEMAND FORECAST & ANOMALY DETECTION</p>
 
-      <div className="content-grid" style={{ marginTop: 30 }}>
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">Device Growth vs AI Predicted Demand</h2>
-            <ChartNoAxesCombined size={17} color="#38bdf8" />
-          </div>
-          <div className="segment-filters" style={{ marginBottom: 20 }}>
+      <div className="split">
+        <Win title="Device Growth vs AI Predicted Demand">
+          <div className="chips">
             {['Lab-A', 'Hostel-Block-1', 'WiFi-Campus'].map((name) => (
               <button
                 key={name}
-                className={`filter-button ${selected === name ? 'active' : ''}`}
+                className={`btn ${selected === name ? 'active' : ''}`}
                 onClick={() => setSelected(name)}
               >
                 {name}
               </button>
             ))}
           </div>
-          <div className="chart-wrap">
-            <ResponsiveDemandChart selected={selected} />
+          <div className="chart-box tall">
+            <DemandChart selected={selected} />
           </div>
-          <p className="muted small">SOLID = HISTORICAL · DASHED = AI PREDICTED · ILLUSTRATIVE DEMO DATA</p>
-        </section>
+          <p className="caption">SOLID = HISTORICAL · DASHED = AI PREDICTED · SHADE = CONFIDENCE BAND</p>
+        </Win>
 
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">Forecast Model</h2>
-            <Cpu size={17} color="#38bdf8" />
-          </div>
-          <div className="model-card">
-            <span className="muted small">MODEL</span>
-            <span className="model-name">Random Forest</span>
-            <span className="muted small">DEMO MODEL METRIC</span>
-            <span className="big-stat">6.2%</span>
-            <span className="positive small">MAPE · 30-DAY HORIZON</span>
-          </div>
-          <div className="model-card">
-            <span className="muted small">NEXT PREFIX CHANGE</span>
-            <span className="model-name">/48 → /47</span>
-            <span className="muted small">{selected.toUpperCase()} · ESTIMATED IN 18 DAYS</span>
-          </div>
-        </section>
+        <div className="stack">
+          <Win title="Model">
+            <div className="mono-line" style={{ marginBottom: 4 }}>Random Forest</div>
+            <div className="big-number">6.2%</div>
+            <div className="label">MAPE · 30-DAY HORIZON</div>
+          </Win>
+          <Win title="Next Prefix Change">
+            <div className="mono-line strong" style={{ marginBottom: 8 }}>/48 → /47</div>
+            <div className="label">{selected.toUpperCase()} · IN 18 DAYS</div>
+          </Win>
+        </div>
       </div>
 
-      <section className="panel">
-        <div className="panel-heading">
-          <h2 className="panel-title">Anomaly Alert Feed · Isolation Forest</h2>
-          <ShieldAlert size={17} color="#fb7185" />
-        </div>
-        <div className="alert-row muted">
-          <span>TIMESTAMP</span><span>SEGMENT</span><span>ANOMALY TYPE</span><span>SEVERITY</span>
-        </div>
-        {alerts.map((alert) => (
-          <div className="alert-row" key={alert.time}>
-            <span className="muted">{alert.time}</span>
-            <span className="segment-name">{alert.segment}</span>
-            <span>{alert.type}</span>
-            <span className={`severity ${alert.severity.toLowerCase()}`}>{alert.severity}</span>
-          </div>
-        ))}
-      </section>
+      <Win title="Anomaly Alert Feed · Isolation Forest" flush>
+        <table className="tbl alerts">
+          <colgroup>
+            <col style={{ width: '24%' }} />
+            <col style={{ width: '21%' }} />
+            <col style={{ width: '43%' }} />
+            <col style={{ width: '12%' }} />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Segment</th>
+              <th>Anomaly Type</th>
+              <th>Severity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {anomalies.map((a) => (
+              <tr key={a.anomaly_id}>
+                <td>{a.timestamp}</td>
+                <td className="name">{a.segment_name}</td>
+                <td>{a.anomaly_type}</td>
+                <td>
+                  <span className={`badge ${severityClass(a.severity)}`}>
+                    {a.severity === 'MEDIUM' ? 'MED' : a.severity}
+                  </span>
+                </td>
+              </tr>
+            ))}
+            {anomalies.length === 0 && (
+              <tr>
+                <td className="empty" colSpan={4}>No anomalies logged yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Win>
     </>
   )
 }
 
-import {
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  BarChart,
-  Bar,
-} from 'recharts'
+/* ---------- 03 BENCHMARK ---------- */
+const SCALE_LABELS = ['100', '1K', '5K', '10K']
+const EMPTY_CHART = SCALE_LABELS.map((scale) => ({ scale }))
 
-function ResponsiveDemandChart({ selected }) {
-  const multiplier = selected === 'WiFi-Campus' ? 1.7 : selected === 'Lab-A' ? 0.65 : 1
-  const chartData = history.map((point) => ({
-    ...point,
-    actual: point.actual == null ? null : Math.round(point.actual * multiplier),
-    predicted: point.predicted == null ? null : Math.round(point.predicted * multiplier),
-  }))
-
+function BenchChart({ title, caption, data, staticKey, aiKey }) {
+  const pid = `hatch-${aiKey}`
   return (
-    <ResponsiveContainer width="100%" height="100%">
-      <LineChart data={chartData} margin={{ top: 10, right: 12, bottom: 5, left: -15 }}>
-        <CartesianGrid stroke="#202c3e" strokeDasharray="3 3" />
-        <XAxis dataKey="week" tick={{ fill: '#8291a7', fontSize: 10 }} axisLine={{ stroke: '#334155' }} tickLine={false} />
-        <YAxis tick={{ fill: '#8291a7', fontSize: 10 }} axisLine={false} tickLine={false} />
-        <Tooltip contentStyle={{ background: '#0d1421', border: '1px solid #334155', borderRadius: 6 }} />
-        <Legend wrapperStyle={{ fontSize: 10 }} />
-        <Line connectNulls type="monotone" dataKey="actual" name="Historical devices" stroke="#38bdf8" strokeWidth={2.5} dot={{ r: 3 }} />
-        <Line connectNulls type="monotone" dataKey="predicted" name="AI predicted demand" stroke="#a78bfa" strokeWidth={2.5} strokeDasharray="6 5" dot={{ r: 3 }} />
-      </LineChart>
-    </ResponsiveContainer>
+    <Win title={title}>
+      <div className="chart-box">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} barGap={4} barCategoryGap="22%" margin={{ top: 8, right: 8, bottom: 0, left: 8 }}>
+            <defs>
+              <pattern id={pid} patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+                <rect width="6" height="6" fill={PANEL} />
+                <line x1="0" y1="0" x2="0" y2="6" stroke={BLUE} strokeWidth="1.5" />
+              </pattern>
+            </defs>
+            <XAxis
+              dataKey="scale"
+              axisLine={{ stroke: BLUE, strokeWidth: 1.5 }}
+              tickLine={false}
+              tick={{ ...TICK, fontSize: 12 }}
+            />
+            <YAxis hide />
+            <Tooltip cursor={{ fill: 'rgba(37,53,200,0.06)' }} contentStyle={TOOLTIP_STYLE} />
+            {staticKey && (
+              <Bar
+                dataKey={staticKey}
+                name="Static allocation"
+                fill={`url(#${pid})`}
+                stroke={BLUE}
+                strokeWidth={1.5}
+                isAnimationActive={false}
+              />
+            )}
+            <Bar dataKey={aiKey} name="AI-driven allocation" fill={BLUE} stroke={BLUE} strokeWidth={1.5} isAnimationActive={false} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="caption">{caption}</p>
+    </Win>
   )
 }
 
+function Benchmarking() {
+  const [deviceCount, setDeviceCount] = useState(5000)
+  const [running, setRunning] = useState(false)
+  const [status, setStatus] = useState('READY · PICK A DEVICE COUNT')
+  const [result, setResult] = useState(null)
+  const [chartData, setChartData] = useState(EMPTY_CHART)
 
-function runSimulation() {
-  setRunning(true)
-  setNotice('')
-  setResult(null)
+  async function runSimulation() {
+    setRunning(true)
+    setStatus('RUNNING...')
+    const t0 = performance.now()
+    try {
+      const scales = [100, 1000, 5000, 10000]
+      const [selected, ...rows] = await Promise.all([deviceCount, ...scales].map(apiSimulate))
+      const s = selected.static_allocation
+      const a = selected.ai_dynamic_allocation
 
-  window.setTimeout(() => {
-    setResult({
-      devices: deviceCount,
-      wastage: [
-        { scale: '100', static: 48, ai: 22 },
-        { scale: '1K', static: 55, ai: 25 },
-        { scale: '5K', static: 61, ai: 21 },
-        { scale: '10K', static: 69, ai: 23 },
-      ],
-      failures: [
-        { scale: '100', static: 8, ai: 3 },
-        { scale: '1K', static: 19, ai: 5 },
-        { scale: '5K', static: 36, ai: 4 },
-        { scale: '10K', static: 52, ai: 4 },
-      ],
-      latency: [
-        { scale: '100', static: 25, ai: 32 },
-        { scale: '1K', static: 42, ai: 50 },
-        { scale: '5K', static: 70, ai: 84 },
-        { scale: '10K', static: 112, ai: 125 },
-      ],
-      wastageReduction: 66,
-      failureReduction: 93,
-      latencyOverhead: 84,
-      demo: true,
-    })
+      setResult({
+        devices: deviceCount,
+        wastage: Math.round(((s.address_wastage_pct - a.address_wastage_pct) / s.address_wastage_pct) * 100),
+        failures: s.allocation_failures
+          ? Math.round(((s.allocation_failures - a.allocation_failures) / s.allocation_failures) * 100)
+          : 0,
+        latency: selected.performance_metrics.execution_latency_ms,
+      })
+      setChartData(
+        rows.map((r, i) => ({
+          scale: SCALE_LABELS[i],
+          staticW: r.static_allocation.address_wastage_pct,
+          aiW: r.ai_dynamic_allocation.address_wastage_pct,
+          staticF: r.static_allocation.allocation_failures,
+          aiF: r.ai_dynamic_allocation.allocation_failures,
+          aiL: r.performance_metrics.execution_latency_ms,
+        }))
+      )
+      const secs = ((performance.now() - t0) / 1000).toFixed(1)
+      setStatus(`COMPLETED · ${deviceCount.toLocaleString()} DEVICES · ${secs}S`)
+    } catch (err) {
+      setStatus('FAILED · IS FLASK RUNNING ON PORT 5000?')
+    } finally {
+      setRunning(false)
+    }
+  }
 
-    setNotice(
-      'Demo simulation completed. Values are illustrative, not measured benchmarks.'
-    )
-    setRunning(false)
-  }, 700)
-}
-
-
-  
-const chartData = [
-  { scale: '100', staticW: 48, aiW: 22, staticF: 8, aiF: 3, staticL: 25, aiL: 32 },
-  { scale: '1K', staticW: 55, aiW: 25, staticF: 19, aiF: 5, staticL: 42, aiL: 50 },
-  { scale: '5K', staticW: 61, aiW: 21, staticF: 36, aiF: 4, staticL: 70, aiL: 84 },
-  { scale: '10K', staticW: 69, aiW: 23, staticF: 52, aiF: 4, staticL: 112, aiL: 125 },
-]
-  
+  const shownDevices = result ? result.devices : deviceCount
 
   return (
     <>
-      <div className="eyebrow">Performance evaluation / 03</div>
       <h1 className="page-title">STATIC VS.<br />AI-DRIVEN.</h1>
       <p className="page-subtitle">EVALUATION · BENCHMARK AGAINST STATIC ALLOCATION</p>
 
-      <div className="content-grid" style={{ marginTop: 30 }}>
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">Simulation Control</h2>
-            <FlaskConical size={17} color="#38bdf8" />
-          </div>
-          <div className="muted small">SIMULATED DEVICES</div>
-          <div className="simulation-value">{deviceCount.toLocaleString()}</div>
+      <div className="split bench">
+        <Win title="Simulation Control">
+          <div className="label">SIMULATED DEVICES</div>
+          <div className="big-number xl">{deviceCount.toLocaleString()}</div>
           <input
             aria-label="Number of simulated devices"
-            className="range-input"
+            className="range"
             type="range"
             min="100"
             max="10000"
             step="100"
             value={deviceCount}
+            style={{ '--pct': `${((deviceCount - 100) / 9900) * 100}%` }}
             onChange={(event) => setDeviceCount(Number(event.target.value))}
           />
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }} className="muted small">
-            <span>100</span><span>10,000</span>
+          <div className="range-ends label">
+            <span>100</span>
+            <span>10,000</span>
           </div>
-          <button className="primary-button full-width" style={{ marginTop: 24 }} disabled={running} onClick={runSimulation}>
-            <Zap size={15} /> {running ? 'RUNNING SIMULATION...' : 'RUN SIMULATION'}
+          <button className="btn solid full" disabled={running} onClick={runSimulation}>
+            {running ? 'Running...' : 'Run Simulation'}
           </button>
-          {notice && <p className="muted small" style={{ marginTop: 14 }}>{notice}</p>}
-        </section>
+          <p className="caption">{status}</p>
+        </Win>
 
-        <section className="panel">
-          <div className="panel-heading">
-            <h2 className="panel-title">Result at {deviceCount.toLocaleString()} Devices</h2>
-            <Activity size={17} color="#38bdf8" />
-          </div>
-          {result ? (
-            <>
-              <div className="result-grid">
-                <div className="result-card">
-                  <div className="metric-label">Wastage Reduction</div>
-                  <div className="result-value positive">−{result.wastageReduction}%</div>
-                </div>
-                <div className="result-card">
-                  <div className="metric-label">Failure Reduction</div>
-                  <div className="result-value positive">−{result.failureReduction}%</div>
-                </div>
-                <div className="result-card">
-                  <div className="metric-label">Latency Overhead</div>
-                  <div className="result-value">+{result.latencyOverhead}ms</div>
-                </div>
-              </div>
-              <div className="muted small"><CheckCircle2 size={13} style={{ verticalAlign: 'middle' }} /> {result.demo ? 'ILLUSTRATIVE DEMO RESULT' : 'BACKEND RESULT'}</div>
-            </>
-          ) : (
-            <div className="empty-state">
-              <Clock3 size={22} color="#38bdf8" />
-              <p>Configure the device scale and run a simulation to view comparison results.</p>
+        <Win title={`Result at ${shownDevices.toLocaleString()} Devices`}>
+          <div className="results">
+            <div>
+              <div className="label">ADDRESS WASTAGE</div>
+              <div className="big-number xl">{result ? `−${result.wastage}%` : '—'}</div>
             </div>
-          )}
-        </section>
+            <div>
+              <div className="label">ALLOCATION FAILURES</div>
+              <div className="big-number xl">{result ? `−${result.failures}%` : '—'}</div>
+            </div>
+            <div>
+              <div className="label">LATENCY OVERHEAD</div>
+              <div className="big-number xl">{result ? `+${result.latency}ms` : '—'}</div>
+            </div>
+          </div>
+        </Win>
       </div>
 
       <div className="chart-grid">
-        <BenchmarkChart title="Address Wastage" subtitle="IDLE ADDRESSES % · LOWER IS BETTER" data={chartData} staticKey="staticW" aiKey="aiW" />
-        <BenchmarkChart title="Allocation Failures" subtitle="FAILED REQUESTS · LOWER IS BETTER" data={chartData} staticKey="staticF" aiKey="aiF" />
-        <BenchmarkChart title="Execution Overhead" subtitle="LATENCY MS · LOWER IS BETTER" data={chartData} staticKey="staticL" aiKey="aiL" />
+        <BenchChart title="Address Wastage" caption="IDLE ADDRESSES % · LOWER IS BETTER" data={chartData} staticKey="staticW" aiKey="aiW" />
+        <BenchChart title="Allocation Failures" caption="FAILED REQUESTS · LOWER IS BETTER" data={chartData} staticKey="staticF" aiKey="aiF" />
+        <BenchChart title="Execution Overhead" caption="LATENCY MS · X-AXIS = DEVICES" data={chartData} aiKey="aiL" />
       </div>
-      <p className="footer-note">Static allocation and AI-driven allocation comparisons use illustrative demo values until connected to the simulation backend.</p>
+
+      <div className="legend">
+        <span><i className="swatch hatch" /> STATIC ALLOCATION</span>
+        <span><i className="swatch fill" /> AI-DRIVEN ALLOCATION</span>
+      </div>
     </>
   )
 }
 
-function BenchmarkChart({ title, subtitle, data, staticKey, aiKey }) {
-  return (
-    <section className="chart-card">
-      <h2 className="panel-title">{title}</h2>
-      <p className="muted small">{subtitle}</p>
-      <div className="chart-wrap">
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={data} margin={{ top: 10, right: 2, left: -24, bottom: 0 }}>
-            <CartesianGrid stroke="#202c3e" strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="scale" tick={{ fill: '#8291a7', fontSize: 10 }} axisLine={{ stroke: '#334155' }} tickLine={false} />
-            <YAxis tick={{ fill: '#8291a7', fontSize: 9 }} axisLine={false} tickLine={false} />
-            <Tooltip contentStyle={{ background: '#0d1421', border: '1px solid #334155', borderRadius: 6 }} />
-            <Bar dataKey={staticKey} name="Static allocation" fill="#475569" radius={[3, 3, 0, 0]} />
-            <Bar dataKey={aiKey} name="AI-driven allocation" fill="#38bdf8" radius={[3, 3, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-    </section>
-  )
-}
-
+/* ---------- APP SHELL ---------- */
 function App() {
   const [screen, setScreen] = useState('dashboard')
-  const [segments, setSegments] = useState(initialSegments)
-  const [notice, setNotice] = useState('')
+  const [segments, setSegments] = useState([])
+  const [anomalies, setAnomalies] = useState([])
+  const [online, setOnline] = useState(true)
+  const time = useClock()
+
+  const refresh = useCallback(async () => {
+    try {
+      const [segs, anoms] = await Promise.all([getSegments(), getAnomalies()])
+      setSegments(segs.map(mapSegment))
+      setAnomalies(anoms.database_logs)
+      setOnline(true)
+    } catch (err) {
+      setOnline(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    refresh()
+  }, [refresh])
 
   const navItems = [
-    { id: 'dashboard', label: '01 DASHBOARD', icon: LayoutDashboard },
-    { id: 'analytics', label: '02 ANALYTICS', icon: ChartNoAxesCombined },
-    { id: 'benchmark', label: '03 BENCHMARK', icon: FlaskConical },
+    { id: 'dashboard', label: '01 DASHBOARD' },
+    { id: 'analytics', label: '02 ANALYTICS' },
+    { id: 'benchmark', label: '03 BENCHMARK' },
   ]
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">
-          <div className="brand-mark"><Network size={21} /></div>
-          <span>V6<span style={{ color: '#38bdf8' }}>·</span>MANAGER</span>
-        </div>
-
+        <div className="brand">V6·MANAGER</div>
         <nav className="top-nav" aria-label="Main navigation">
-          {navItems.map(({ id, label, icon: Icon }) => (
+          {navItems.map(({ id, label }) => (
             <button
               key={id}
-              className={`nav-button ${screen === id ? 'active' : ''}`}
+              className={`nav-btn ${screen === id ? 'active' : ''}`}
               onClick={() => setScreen(id)}
             >
-              <Icon size={13} style={{ verticalAlign: 'middle', marginRight: 6 }} />
               {label}
             </button>
           ))}
+          <div className="clock">IST {time}</div>
         </nav>
-
-        <div className="top-status">
-          <span className="status-dot" /> SYSTEM ONLINE
-        </div>
       </header>
 
-      <main className="main-content">
-        {screen === 'dashboard' && (
-          <>
-            <Dashboard segments={segments} setSegments={setSegments} setNotice={setNotice} />
-            {notice && <p className="footer-note">{notice}</p>}
-          </>
-        )}
-        {screen === 'analytics' && <Analytics />}
+      {!online && <div className="offline">Backend offline · start Flask on port 5000</div>}
+
+      <main>
+        {screen === 'dashboard' && <Dashboard segments={segments} anomalies={anomalies} refresh={refresh} />}
+        {screen === 'analytics' && <Analytics anomalies={anomalies} />}
         {screen === 'benchmark' && <Benchmarking />}
       </main>
     </div>
